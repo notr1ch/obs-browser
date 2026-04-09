@@ -2,6 +2,7 @@
 
 #include "cef-headers.hpp"
 #include "browser-panel-internal.hpp"
+#include "browser-session.hpp"
 
 #include <string>
 
@@ -16,11 +17,12 @@ class QCefBrowserClient : public CefClient,
 			  public CefJSDialogHandler {
 
 public:
-	inline QCefBrowserClient(QCefWidgetInternal *widget_, const std::string &script_, bool allowAllPopups_)
-		: widget(widget_),
-		  script(script_),
+	inline QCefBrowserClient(std::shared_ptr<BrowserSession> session_, const std::string &script_,
+				 bool allowAllPopups_)
+		: session(session_),
 		  allowAllPopups(allowAllPopups_)
 	{
+		session->setScript(script_);
 	}
 
 	/* CefClient */
@@ -60,8 +62,6 @@ public:
 				   CefRefPtr<CefClient> &client, CefBrowserSettings &settings,
 				   CefRefPtr<CefDictionaryValue> &extra_info, bool *no_javascript_access) override;
 
-	virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override;
-
 	/* CefFocusHandler */
 	virtual bool OnSetFocus(CefRefPtr<CefBrowser> browser, CefFocusHandler::FocusSource source) override;
 
@@ -96,9 +96,10 @@ public:
 				const CefString &default_prompt_text, CefRefPtr<CefJSDialogCallback> callback,
 				bool &suppress_message) override;
 
-	QCefWidgetInternal *widget = nullptr;
-	std::string script;
+	std::shared_ptr<BrowserSession> session;
 	bool allowAllPopups;
 
 	IMPLEMENT_REFCOUNTING(QCefBrowserClient);
 };
+
+bool zoomPage(CefRefPtr<CefBrowserHost> host, int direction);

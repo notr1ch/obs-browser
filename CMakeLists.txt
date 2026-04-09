@@ -27,6 +27,7 @@ target_sources(
           browser-client.hpp
           browser-scheme.cpp
           browser-scheme.hpp
+          browser-session.hpp
           browser-version.h
           cef-headers.hpp
           deps/base64/base64.cpp

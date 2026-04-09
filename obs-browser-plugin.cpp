@@ -425,6 +425,9 @@ extern "C" EXPORT void obs_browser_initialize(void)
 		manager_thread = thread(BrowserManagerThread);
 #endif
 	}
+
+	// Wait for CEF to start up so callers can immediately start using it
+	os_event_timedwait(cef_started_event, 15000);
 }
 
 void RegisterBrowserSource()

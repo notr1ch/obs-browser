@@ -33,9 +33,6 @@ std::mutex popup_whitelist_mutex;
 std::vector<PopupWhitelistInfo> popup_whitelist;
 std::vector<PopupWhitelistInfo> forced_popups;
 
-static int zoomLvls[] = {25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400};
-
-namespace {
 void detachBrowserWindow(CefRefPtr<CefBrowserHost> host)
 {
 #ifdef _WIN32
@@ -63,9 +60,35 @@ void detachBrowserWindow(CefRefPtr<CefBrowserHost> host)
 	UNUSED_PARAMETER(host);
 #endif
 }
-} // namespace
 
-/* ------------------------------------------------------------------------- */
+void SetBrowserSize(CefRefPtr<CefBrowser> browser, QSize size)
+{
+	QueueCEFTask([browser, size]() {
+		CefWindowHandle handle = browser->GetHost()->GetWindowHandle();
+		if (!handle)
+			return;
+#ifdef _WIN32
+		SetWindowPos((HWND)handle, nullptr, 0, 0, size.width(), size.height(),
+			     SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+		SendMessage((HWND)handle, WM_SIZE, 0, MAKELPARAM(size.width(), size.height()));
+#elif !defined(__APPLE__)
+		Display *xDisplay = cef_get_xdisplay();
+		if (!xDisplay)
+			return;
+		XWindowChanges changes = {0};
+		changes.x = 0;
+		changes.y = 0;
+		changes.width = size.width();
+		changes.height = size.height();
+		XConfigureWindow(xDisplay, (Window)handle, CWX | CWY | CWHeight | CWWidth, &changes);
+#if CHROME_VERSION_BUILD >= 4638
+		XSync(xDisplay, false);
+#endif
+#endif
+	});
+}
+
+// -------------------------------------------------------------------------
 
 class CookieCheck : public CefCookieVisitor {
 public:
@@ -159,12 +182,13 @@ struct QCefCookieManagerInternal : QCefCookieManager {
 	}
 };
 
-/* ------------------------------------------------------------------------- */
+// -------------------------------------------------------------------------
 
 QCefWidgetInternal::QCefWidgetInternal(QWidget *parent, const std::string &url_, CefRefPtr<CefRequestContext> rqc_)
 	: QCefWidget(parent),
 	  url(url_),
-	  rqc(rqc_)
+	  rqc(rqc_),
+	  session(std::make_shared<BrowserSession>(this))
 {
 	setAttribute(Qt::WA_PaintOnScreen);
 	setAttribute(Qt::WA_StaticContents);
@@ -183,54 +207,13 @@ QCefWidgetInternal::QCefWidgetInternal(QWidget *parent, const std::string &url_,
 
 QCefWidgetInternal::~QCefWidgetInternal()
 {
-	closeBrowser();
+	session->detachWidget();
+	session->close();
 }
 
 void QCefWidgetInternal::closeBrowser()
 {
-	if (!cefBrowser) {
-		return;
-	}
-
-	CefRefPtr<CefBrowserHost> host{cefBrowser->GetHost()};
-
-	if (!host) {
-		return;
-	}
-
-	QEventLoop browserCloseLoop;
-
-	// Ensure that the native window used by CEF is not attached to the widget view hierarchy while the browser
-	// is closed.
-	//
-	// If the host window is not considered "destroyed" by the time CEF destroys the web contents of the associated
-	// browser object, it will close the host window itself. The "host" window in this case would be OBS Studio's
-	// main window however. So to ensure this cannot happen, the native window needs to be detached from the Qt
-	// view hierarchy so there is no associated host window to close.
-	auto preCloseBrowser = [&host]() {
-		detachBrowserWindow(host);
-	};
-
-	auto closeBrowser = [&host]() {
-		host->CloseBrowser(true);
-	};
-
-	connect(this, &QCefWidgetInternal::readyToClose, &browserCloseLoop, &QEventLoop::quit);
-
-	QTimer::singleShot(0, &browserCloseLoop, preCloseBrowser);
-	QTimer::singleShot(0, &browserCloseLoop, closeBrowser);
-	QTimer::singleShot(1000, &browserCloseLoop, &QEventLoop::quit);
-
-	browserCloseLoop.exec();
-
-	CefRefPtr<CefClient> client{host->GetClient()};
-
-	if (client) {
-		QCefBrowserClient *browserClient{static_cast<QCefBrowserClient *>(client.get())};
-		browserClient->widget = nullptr;
-	}
-
-	cefBrowser = nullptr;
+	session->close();
 }
 
 #ifdef __linux__
@@ -252,19 +235,20 @@ static bool XWindowHasAtom(Display *display, Window w, Atom a)
 	return type != None;
 }
 
-/* On Linux / X11, CEF sets the XdndProxy of the toplevel window
- * it's attached to, so that it can read drag events. When this
- * toplevel happens to be OBS Studio's main window (e.g. when a
- * browser panel is docked into to the main window), setting the
- * XdndProxy atom ends up breaking DnD of sources and scenes. Thus,
- * we have to manually unset this atom.
- */
+// On Linux / X11, CEF sets the XdndProxy of the toplevel window
+// it's attached to, so that it can read drag events. When this
+// toplevel happens to be OBS Studio's main window (e.g. when a
+// browser panel is docked into to the main window), setting the
+// XdndProxy atom ends up breaking DnD of sources and scenes. Thus,
+// we have to manually unset this atom.
+
 void QCefWidgetInternal::unsetToplevelXdndProxy()
 {
-	if (!cefBrowser)
+	CefRefPtr<CefBrowser> b = getBrowser();
+	if (!b)
 		return;
 
-	CefWindowHandle browserHandle = cefBrowser->GetHost()->GetWindowHandle();
+	CefWindowHandle browserHandle = b->GetHost()->GetWindowHandle();
 	Display *xDisplay = cef_get_xdisplay();
 	Window toplevel, root, parent, *children;
 	unsigned int nChildren;
@@ -305,56 +289,91 @@ void QCefWidgetInternal::unsetToplevelXdndProxy()
 
 void QCefWidgetInternal::Init()
 {
+	// Capture a weak_ptr to the session. The session is ref-counted independently of the widget so that
+	// it can outlive the widget and safely handle browser callbacks.
+	std::weak_ptr<BrowserSession> weakSession = session;
+
+	// We copy all the necessary data into the lambda here, because once we queue the task, the widget may
+	// be destroyed at any time and its members will no longer be valid. The session will keep the browser
+	// alive until it's safe to destroy it.
+	std::string initUrl = url;
+	std::string initScript = script;
+	bool initAllowPopups = allowAllPopups_;
+	CefRefPtr<CefRequestContext> initRqc = rqc;
+
+	// Tells the session that we're about to create a browser, so it can properly handle any close() calls
+	// that happen while CEF is busy.
+	session->onBeforeCreate();
+
 #ifndef __APPLE__
 	WId handle = window->winId();
-	QSize size = this->size();
-	size *= devicePixelRatioF();
-	bool success = QueueCEFTask(
-		[this, handle, size]()
+	QSize size = this->size() * devicePixelRatioF();
 #else
 	WId handle = winId();
-	bool success = QueueCEFTask(
-		[this, handle]()
 #endif
-		{
-			CefWindowInfo windowInfo;
 
-			/* Make sure Init isn't called more than once. */
-			if (cefBrowser)
-				return;
-
-#ifdef __APPLE__
-			QSize size = this->size();
+	bool success = QueueCEFTask([weakSession, handle, initUrl, initScript, initAllowPopups, initRqc
+#ifndef __APPLE__
+				     ,
+				     size
 #endif
+	]() {
+		auto s = weakSession.lock();
+		if (!s)
+			return;
+
+		CefWindowInfo windowInfo;
 
 #if CHROME_VERSION_BUILD >= 6533
-			windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+		windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
 #endif
 
-			windowInfo.SetAsChild((CefWindowHandle)handle, CefRect(0, 0, size.width(), size.height()));
+		windowInfo.SetAsChild((CefWindowHandle)handle, CefRect(0, 0, size.width(), size.height()));
 
-			CefRefPtr<QCefBrowserClient> browserClient =
-				new QCefBrowserClient(this, script, allowAllPopups_);
+#ifdef __APPLE__
+		// FIXME: Why is this inside the task on Apple? Unsafe UI access from CEF thread.
+		QCefWidgetInternal *w = s->getWidget();
+		if (!w)
+			return;
+		QSize size = w->size();
+#endif
 
-			CefBrowserSettings cefBrowserSettings;
-			cefBrowser = CefBrowserHost::CreateBrowserSync(windowInfo, browserClient, url,
-								       cefBrowserSettings,
-								       CefRefPtr<CefDictionaryValue>(), rqc);
+		CefRefPtr<QCefBrowserClient> browserClient = new QCefBrowserClient(s, initScript, initAllowPopups);
+
+		CefBrowserSettings cefBrowserSettings;
+		CefRefPtr<CefBrowser> browser =
+			CefBrowserHost::CreateBrowserSync(windowInfo, browserClient, initUrl, cefBrowserSettings,
+							  CefRefPtr<CefDictionaryValue>(), initRqc);
+
+		if (!browser) {
+			s->onBrowserCreationFailed();
+			return;
+		}
+
+		// Hand the browser to the session. If close() was called while we were in CreateBrowserSync, the
+		// session will close it immediately.
+		s->onBrowserCreated(browser);
 
 #ifdef __linux__
-			QueueCEFTask([this]() { unsetToplevelXdndProxy(); });
-#endif
+		// We must take a weak ref as the widget could be destroyed at any time by the UI thread.
+		auto weakS = s->weak_from_this();
+		QueueCEFTask([weakS]() {
+			auto sess = weakS.lock();
+			if (!sess)
+				return;
+			QCefWidgetInternal *w = sess->getWidget();
+			if (w)
+				w->unsetToplevelXdndProxy();
 		});
+#endif
+	});
 
 	if (success) {
-		timer.stop();
 #ifndef __APPLE__
 		if (!container) {
 			container = QWidget::createWindowContainer(window, this);
 			container->show();
 		}
-
-		Resize();
 #endif
 	}
 }
@@ -364,61 +383,33 @@ void QCefWidgetInternal::resizeEvent(QResizeEvent *event)
 	QWidget::resizeEvent(event);
 #ifndef __APPLE__
 	Resize();
+#endif
 }
 
+#ifndef __APPLE__
 void QCefWidgetInternal::Resize()
 {
 	QSize size = this->size() * devicePixelRatioF();
 
-	bool success = QueueCEFTask([this, size]() {
-		if (!cefBrowser)
-			return;
+	CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (browser) {
+		SetBrowserSize(browser, size);
+	} else {
+		session->setSize(size);
+	}
 
-		CefWindowHandle handle = cefBrowser->GetHost()->GetWindowHandle();
-
-		if (!handle)
-			return;
-
-#ifdef _WIN32
-		SetWindowPos((HWND)handle, nullptr, 0, 0, size.width(), size.height(),
-			     SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);
-		SendMessage((HWND)handle, WM_SIZE, 0, MAKELPARAM(size.width(), size.height()));
-#else
-		Display *xDisplay = cef_get_xdisplay();
-
-		if (!xDisplay)
-			return;
-
-		XWindowChanges changes = {0};
-		changes.x = 0;
-		changes.y = 0;
-		changes.width = size.width();
-		changes.height = size.height();
-		XConfigureWindow(xDisplay, (Window)handle, CWX | CWY | CWHeight | CWWidth, &changes);
-#if CHROME_VERSION_BUILD >= 4638
-		XSync(xDisplay, false);
-#endif
-#endif
-	});
-
-	if (success && container)
+	if (container)
 		container->resize(size.width(), size.height());
+}
 #endif
-}
-
-void QCefWidgetInternal::finishCloseBrowser()
-{
-	emit readyToClose();
-}
 
 void QCefWidgetInternal::showEvent(QShowEvent *event)
 {
 	QWidget::showEvent(event);
 
-	if (!cefBrowser) {
+	//CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (!session->isActive()) {
 		obs_browser_initialize();
-		connect(&timer, &QTimer::timeout, this, &QCefWidgetInternal::Init);
-		timer.start(500);
 		Init();
 	}
 }
@@ -431,30 +422,32 @@ QPaintEngine *QCefWidgetInternal::paintEngine() const
 void QCefWidgetInternal::setURL(const std::string &url_)
 {
 	url = url_;
-	if (cefBrowser) {
-		cefBrowser->GetMainFrame()->LoadURL(url);
+	CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (browser) {
+		browser->GetMainFrame()->LoadURL(url);
 	}
 }
 
 void QCefWidgetInternal::reloadPage()
 {
-	if (cefBrowser)
-		cefBrowser->ReloadIgnoreCache();
+	CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (browser)
+		browser->ReloadIgnoreCache();
 }
 
 void QCefWidgetInternal::setStartupScript(const std::string &script_)
 {
-	script = script_;
+	session->setScript(script_);
 }
 
 void QCefWidgetInternal::executeJavaScript(const std::string &script_)
 {
-	if (!cefBrowser)
-		return;
-
-	CefRefPtr<CefFrame> frame = cefBrowser->GetMainFrame();
-	std::string url = frame->GetURL();
-	frame->ExecuteJavaScript(script_, url, 0);
+	CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (browser) {
+		CefRefPtr<CefFrame> frame = browser->GetMainFrame();
+		std::string url = frame->GetURL();
+		frame->ExecuteJavaScript(script_, url, 0);
+	}
 }
 
 void QCefWidgetInternal::allowAllPopups(bool allow)
@@ -464,45 +457,15 @@ void QCefWidgetInternal::allowAllPopups(bool allow)
 
 bool QCefWidgetInternal::zoomPage(int direction)
 {
-	if (!cefBrowser || direction < -1 || direction > 1)
+	CefRefPtr<CefBrowser> browser = session->getBrowser();
+	if (!browser || direction < -1 || direction > 1)
 		return false;
 
-	CefRefPtr<CefBrowserHost> host = cefBrowser->GetHost();
-	if (direction == 0) {
-		// Reset zoom
-		host->SetZoomLevel(0);
-		return true;
-	}
-
-	int currentZoomPercent = round(pow(1.2, host->GetZoomLevel()) * 100.0);
-	int zoomCount = sizeof(zoomLvls) / sizeof(zoomLvls[0]);
-	int zoomIdx = 0;
-
-	while (zoomIdx < zoomCount) {
-		if (zoomLvls[zoomIdx] == currentZoomPercent) {
-			break;
-		}
-		zoomIdx++;
-	}
-	if (zoomIdx == zoomCount)
+	CefRefPtr<CefBrowserHost> host = browser->GetHost();
+	if (!host)
 		return false;
 
-	int newZoomIdx = zoomIdx;
-	if (direction == -1 && zoomIdx > 0) {
-		// Zoom out
-		newZoomIdx -= 1;
-	} else if (direction == 1 && zoomIdx >= 0 && zoomIdx < zoomCount - 1) {
-		// Zoom in
-		newZoomIdx += 1;
-	}
-
-	if (newZoomIdx != zoomIdx) {
-		int newZoomLvl = zoomLvls[newZoomIdx];
-		// SetZoomLevel only accepts a zoomLevel, not a percentage
-		host->SetZoomLevel(log(newZoomLvl / 100.0) / log(1.2));
-		return true;
-	}
-	return false;
+	return ::zoomPage(host, direction);
 }
 
 /* ------------------------------------------------------------------------- */

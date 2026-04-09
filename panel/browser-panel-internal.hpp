@@ -3,6 +3,7 @@
 #include <QTimer>
 #include <QPointer>
 #include "browser-panel.hpp"
+#include "browser-session.hpp"
 #include "cef-headers.hpp"
 
 #include <vector>
@@ -28,11 +29,10 @@ public:
 	QCefWidgetInternal(QWidget *parent, const std::string &url, CefRefPtr<CefRequestContext> rqc);
 	~QCefWidgetInternal();
 
-	CefRefPtr<CefBrowser> cefBrowser;
+	std::shared_ptr<BrowserSession> session;
 	std::string url;
 	std::string script;
 	CefRefPtr<CefRequestContext> rqc;
-	QTimer timer;
 #ifndef __APPLE__
 	QPointer<QWindow> window;
 	QPointer<QWidget> container;
@@ -51,7 +51,6 @@ public:
 	virtual bool zoomPage(int direction) override;
 	virtual void executeJavaScript(const std::string &script) override;
 
-	void finishCloseBrowser();
 	void Resize();
 
 #ifdef __linux__
@@ -62,7 +61,4 @@ private:
 
 public slots:
 	void Init();
-
-signals:
-	void readyToClose();
 };

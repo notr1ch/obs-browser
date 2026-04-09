@@ -27,7 +27,47 @@
 #define MENU_ITEM_ZOOM_OUT MENU_ID_CUSTOM_FIRST + 4
 #define MENU_ITEM_COPY_URL MENU_ID_CUSTOM_FIRST + 5
 
-/* CefClient */
+static int zoomLvls[] = {25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400};
+
+bool zoomPage(CefRefPtr<CefBrowserHost> host, int direction)
+{
+	if (!host || direction < -1 || direction > 1)
+		return false;
+
+	if (direction == 0) {
+		host->SetZoomLevel(0);
+		return true;
+	}
+
+	int currentZoomPercent = (int)round(pow(1.2, host->GetZoomLevel()) * 100.0);
+	int zoomCount = sizeof(zoomLvls) / sizeof(zoomLvls[0]);
+	int zoomIdx = 0;
+
+	while (zoomIdx < zoomCount) {
+		if (zoomLvls[zoomIdx] == currentZoomPercent)
+			break;
+		zoomIdx++;
+	}
+	if (zoomIdx == zoomCount)
+		return false;
+
+	int newZoomIdx = zoomIdx;
+	if (direction == -1 && zoomIdx > 0)
+		newZoomIdx -= 1;
+	else if (direction == 1 && zoomIdx < zoomCount - 1)
+		newZoomIdx += 1;
+
+	if (newZoomIdx != zoomIdx) {
+		host->SetZoomLevel(log(zoomLvls[newZoomIdx] / 100.0) / log(1.2));
+		return true;
+	}
+	return false;
+}
+
+// IMPORTANT DESIGN NOTE: All main thread invokeMethods in the CEF callbacks below must go through QCoreApplication
+// first to push it onto the UI thread, otherwise there is a race condition where the widget exists and gets destroyed
+// in between the check and invoke, causing a crash in invoke (once it's in the event queue it's safe, but not before).
+
 CefRefPtr<CefLoadHandler> QCefBrowserClient::GetLoadHandler()
 {
 	return this;
@@ -68,33 +108,58 @@ CefRefPtr<CefJSDialogHandler> QCefBrowserClient::GetJSDialogHandler()
 	return this;
 }
 
-/* CefDisplayHandler */
 void QCefBrowserClient::OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString &title)
 {
-	if (widget && widget->cefBrowser->IsSame(browser)) {
+	CefRefPtr<CefBrowser> ours = session->getBrowser();
+
+	if (ours && ours->IsSame(browser)) {
+
 		std::string str_title = title;
 		QString qt_title = QString::fromUtf8(str_title.c_str());
-		QMetaObject::invokeMethod(widget, "titleChanged", Q_ARG(QString, qt_title));
-	} else { /* handle popup title */
-		CefString newTitle = title;
-		if (title.compare("DevTools") == 0 && widget)
-			newTitle = QString(obs_module_text("DevTools"))
-					   .arg(widget->parentWidget()->windowTitle())
-					   .toUtf8()
-					   .constData();
+
+		auto weakSession = std::weak_ptr<BrowserSession>(session);
+		QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), [weakSession, qt_title]() {
+			auto s = weakSession.lock();
+			if (!s)
+				return;
+			QCefWidgetInternal *w = s->getWidget();
+			if (w)
+				QMetaObject::invokeMethod(w, "titleChanged", Q_ARG(QString, qt_title));
+		});
+	} else {
+		// Popup title — post everything to the main UI thread to avoid cross-thread issues
+		std::string str_title = title.ToString();
+		auto weakSession = std::weak_ptr<BrowserSession>(session);
+		CefRefPtr<CefBrowserHost> host = browser->GetHost();
+
+		QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), [weakSession, host, str_title]() {
+			std::string finalTitle = str_title;
+
+			if (str_title == "DevTools") {
+				auto s = weakSession.lock();
+				if (s) {
+					QCefWidgetInternal *w = s->getWidget();
+					if (w && w->parentWidget()) {
+						finalTitle = QString(obs_module_text("DevTools"))
+								     .arg(w->parentWidget()->windowTitle())
+								     .toUtf8()
+								     .constData();
+					}
+				}
+			}
 
 #if defined(_WIN32)
-		CefWindowHandle handl = browser->GetHost()->GetWindowHandle();
-		std::wstring str_title = newTitle;
-		SetWindowTextW((HWND)handl, str_title.c_str());
+			CefWindowHandle handl = host->GetWindowHandle();
+			std::wstring wTitle(CefString(finalTitle).ToWString());
+			SetWindowTextW((HWND)handl, wTitle.c_str());
 #elif defined(__linux__)
-		CefWindowHandle handl = browser->GetHost()->GetWindowHandle();
-		XStoreName(cef_get_xdisplay(), handl, newTitle.ToString().c_str());
+			CefWindowHandle handl = host->GetWindowHandle();
+			XStoreName(cef_get_xdisplay(), handl, finalTitle.c_str());
 #endif
+		});
 	}
 }
 
-/* CefRequestHandler */
 bool QCefBrowserClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>,
 				       CefRefPtr<CefRequest> request, bool, bool)
 {
@@ -110,7 +175,7 @@ bool QCefBrowserClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<
 		}
 
 		if (astrcmpi(info.url.c_str(), str_url.c_str()) == 0) {
-			/* Open tab popup URLs in user's actual browser */
+			// Open tab popup URLs in user's actual browser
 			QUrl url = QUrl(str_url.c_str(), QUrl::TolerantMode);
 			QDesktopServices::openUrl(url);
 			browser->GoBack();
@@ -118,10 +183,18 @@ bool QCefBrowserClient::OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<
 		}
 	}
 
-	if (widget) {
-		QString qt_url = QString::fromUtf8(str_url.c_str());
-		QMetaObject::invokeMethod(widget, "urlChanged", Q_ARG(QString, qt_url));
-	}
+	auto weakSession = std::weak_ptr<BrowserSession>(session);
+	QString qt_url = QString::fromUtf8(str_url.c_str());
+
+	QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), [weakSession, qt_url]() {
+		auto s = weakSession.lock();
+		if (!s)
+			return;
+		QCefWidgetInternal *w = s->getWidget();
+		if (w)
+			QMetaObject::invokeMethod(w, "urlChanged", Q_ARG(QString, qt_url));
+	});
+
 	return false;
 }
 
@@ -130,7 +203,7 @@ bool QCefBrowserClient::OnOpenURLFromTab(CefRefPtr<CefBrowser>, CefRefPtr<CefFra
 {
 	std::string str_url = target_url;
 
-	/* Open tab popup URLs in user's actual browser */
+	// Open tab popup URLs in user's actual browser
 	QUrl url = QUrl(str_url.c_str(), QUrl::TolerantMode);
 	QDesktopServices::openUrl(url);
 	return true;
@@ -171,7 +244,6 @@ void QCefBrowserClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<Cef
 	bfree(errorPage);
 }
 
-/* CefLifeSpanHandler */
 bool QCefBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
 #if CHROME_VERSION_BUILD >= 6834
 				      int,
@@ -183,8 +255,11 @@ bool QCefBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>
 {
 	if (allowAllPopups) {
 #ifdef _WIN32
-		HWND hwnd = (HWND)widget->effectiveWinId();
-		windowInfo.parent_window = hwnd;
+		QCefWidgetInternal *w = session->getWidget();
+		if (w) {
+			HWND hwnd = (HWND)w->effectiveWinId();
+			windowInfo.parent_window = hwnd;
+		}
 #else
 		UNUSED_PARAMETER(windowInfo);
 #endif
@@ -204,40 +279,34 @@ bool QCefBrowserClient::OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>
 
 		if (astrcmpi(info.url.c_str(), str_url.c_str()) == 0) {
 #ifdef _WIN32
-			HWND hwnd = (HWND)widget->effectiveWinId();
-			windowInfo.parent_window = hwnd;
+			QCefWidgetInternal *w = session->getWidget();
+			if (w) {
+				HWND hwnd = (HWND)w->effectiveWinId();
+				windowInfo.parent_window = hwnd;
+			}
 #endif
 			return false;
 		}
 	}
 
-	/* Open popup URLs in user's actual browser */
+	// Open popup URLs in user's actual browser
 	QUrl url = QUrl(str_url.c_str(), QUrl::TolerantMode);
 	QDesktopServices::openUrl(url);
 	return true;
 }
 
-void QCefBrowserClient::OnBeforeClose(CefRefPtr<CefBrowser>)
-{
-	if (widget) {
-		widget->finishCloseBrowser();
-	}
-}
-
 bool QCefBrowserClient::OnSetFocus(CefRefPtr<CefBrowser>, CefFocusHandler::FocusSource source)
 {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0) && QT_VERSION < QT_VERSION_CHECK(6, 11, 1)
-	/* Workaround for browser docks flashing/hanging at startup with Qt 6.8.x, introduced
-	 * by commit https://code.qt.io/cgit/qt/qt5.git/commit/?id=bab1fecd556ea561c4a89686293116741acfa1b4.
-	 * Refer to https://bugreports.qt.io/browse/QTBUG-136165.
-	 */
+	// Workaround for browser docks flashing/hanging at startup with Qt 6.8.x, introduced
+	// by commit https://code.qt.io/cgit/qt/qt5.git/commit/?id=bab1fecd556ea561c4a89686293116741acfa1b4.
+	// Refer to https://bugreports.qt.io/browse/QTBUG-136165.
 	UNUSED_PARAMETER(source);
 	return false;
 #else
-	/* Don't steal focus when the webpage navigates. This is especially
-	   obvious on startup when the user has many browser docks defined,
-	   as each one will steal focus one by one, resulting in poor UX.
-	 */
+	// Don't steal focus when the webpage navigates. This is especially
+	// obvious on startup when the user has many browser docks defined,
+	// as each one will steal focus one by one, resulting in poor UX.
 	switch (source) {
 	case FOCUS_SOURCE_NAVIGATION:
 		return true;
@@ -333,30 +402,45 @@ bool QCefBrowserClient::OnContextMenuCommand(CefRefPtr<CefBrowser> browser, CefR
 	CefWindowInfo windowInfo;
 	QPoint pos;
 	switch (command_id) {
-	case MENU_ITEM_DEVTOOLS:
+	case MENU_ITEM_DEVTOOLS: {
+		// DevTools window positioning needs the widget's screen
+		// coordinates. Post to UI thread to access safely.
+		auto weakSession = std::weak_ptr<BrowserSession>(session);
+		int inspectX = params->GetXCoord();
+		int inspectY = params->GetYCoord();
+
+		QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), [weakSession, host, inspectX,
+										   inspectY]() {
+			CefWindowInfo windowInfo;
+			QPoint pos(0, 0);
+
+			auto s = weakSession.lock();
+			if (s) {
+				QCefWidgetInternal *w = s->getWidget();
+				if (w)
+					pos = w->mapToGlobal(QPoint(0, 0));
+			}
+
 #if defined(_WIN32) && CHROME_VERSION_BUILD < 6533
-		windowInfo.SetAsPopup(host->GetWindowHandle(), "");
+			windowInfo.SetAsPopup(host->GetWindowHandle(), "");
 #endif
-		pos = widget->mapToGlobal(QPoint(0, 0));
-		windowInfo.bounds.x = pos.x();
-		windowInfo.bounds.y = pos.y() + 30;
-		windowInfo.bounds.width = 900;
-		windowInfo.bounds.height = 700;
-		host->ShowDevTools(windowInfo, host->GetClient(), CefBrowserSettings(),
-				   {params.get()->GetXCoord(), params.get()->GetYCoord()});
+			windowInfo.bounds.x = pos.x();
+			windowInfo.bounds.y = pos.y() + 30;
+			windowInfo.bounds.width = 900;
+			windowInfo.bounds.height = 700;
+			host->ShowDevTools(windowInfo, host->GetClient(), CefBrowserSettings(), {inspectX, inspectY});
+		});
 		return true;
+	}
 	case MENU_ITEM_MUTE:
 		host->SetAudioMuted(!host->IsAudioMuted());
 		return true;
 	case MENU_ITEM_ZOOM_IN:
-		widget->zoomPage(1);
-		return true;
+		return zoomPage(host, 1);
 	case MENU_ITEM_ZOOM_RESET:
-		widget->zoomPage(0);
-		return true;
+		return zoomPage(host, 0);
 	case MENU_ITEM_ZOOM_OUT:
-		widget->zoomPage(-1);
-		return true;
+		return zoomPage(host, -1);
 	case MENU_ITEM_COPY_URL:
 		std::string url = browser->GetMainFrame()->GetURL().ToString();
 		auto saveClipboard = [url]() {
@@ -392,10 +476,9 @@ void QCefBrowserClient::OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> fra
 	if (!frame->IsMain())
 		return;
 
-	if (widget && !widget->script.empty())
-		frame->ExecuteJavaScript(widget->script, CefString(), 0);
-	else if (!script.empty())
-		frame->ExecuteJavaScript(script, CefString(), 0);
+	std::string s = session->getScript();
+	if (!s.empty())
+		frame->ExecuteJavaScript(s, CefString(), 0);
 }
 
 bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
@@ -403,16 +486,37 @@ bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
 				   const CefString &default_prompt_text, CefRefPtr<CefJSDialogCallback> callback,
 				   bool &)
 {
-	QString parentTitle = widget->parentWidget()->windowTitle();
+	QString parentTitle;
+	QCefWidgetInternal *w = session->getWidget();
+	if (w && w->parentWidget())
+		parentTitle = w->parentWidget()->windowTitle();
+	else
+		parentTitle = QStringLiteral("Browser");
+
 	std::string default_value = default_prompt_text;
 	QString msg_raw(message_text.ToString().c_str());
 	// Replace <br> with standard newline as we will render in plaintext
 	msg_raw.replace(QRegularExpression("<br\\s{0,1}\\/{0,1}>"), "\n");
-	QString submsg = QString(obs_module_text("Dialog.ReceivedFrom")).arg(parentTitle);
-	QString msg = QString("%1\n\n\n%2").arg(msg_raw).arg(submsg);
 
-	if (dialog_type == JSDIALOGTYPE_PROMPT) {
-		auto msgbox = [msg, default_value, callback]() {
+	auto weakSession = std::weak_ptr<BrowserSession>(session);
+
+	QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), [weakSession, msg_raw, default_value,
+									   dialog_type, callback]() {
+		QString parentTitle;
+		auto s = weakSession.lock();
+		if (s) {
+			QCefWidgetInternal *w = s->getWidget();
+			if (w && w->parentWidget())
+				parentTitle = w->parentWidget()->windowTitle();
+		}
+		if (parentTitle.isEmpty())
+			parentTitle = QStringLiteral("Browser");
+
+		QString submsg = QString(obs_module_text("Dialog.ReceivedFrom")).arg(parentTitle);
+		QString msg = QString("%1\n\n\n%2").arg(msg_raw).arg(submsg);
+
+		if (dialog_type == JSDIALOGTYPE_PROMPT) {
+
 			QInputDialog *dlg = new QInputDialog(nullptr);
 			dlg->setWindowFlag(Qt::WindowStaysOnTopHint, true);
 			dlg->setWindowFlag(Qt::WindowContextHelpButtonHint, false);
@@ -434,11 +538,10 @@ bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
 				lbl->setTextFormat(Qt::PlainText);
 			}
 			dlg->setLabelText(msg);
-		};
-		QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), msgbox);
-		return true;
-	}
-	auto msgbox = [msg, dialog_type, callback]() {
+
+			return true;
+		}
+
 		QMessageBox *dlg = new QMessageBox(nullptr);
 		dlg->setStandardButtons(QMessageBox::Ok);
 		dlg->setWindowFlag(Qt::WindowStaysOnTopHint, true);
@@ -467,8 +570,8 @@ bool QCefBrowserClient::OnJSDialog(CefRefPtr<CefBrowser>, const CefString &,
 		QWidget::connect(dlg, &QMessageBox::finished, finished);
 
 		dlg->open();
-	};
-	QMetaObject::invokeMethod(QCoreApplication::instance()->thread(), msgbox);
+		return true;
+	});
 	return true;
 }
 
@@ -476,6 +579,8 @@ bool QCefBrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser, const CefKe
 {
 	if (event.type != KEYEVENT_RAWKEYDOWN)
 		return false;
+
+	CefRefPtr<CefBrowserHost> host = browser->GetHost();
 
 	if (event.windows_key_code == 'R' &&
 #ifdef __APPLE__
@@ -487,16 +592,13 @@ bool QCefBrowserClient::OnPreKeyEvent(CefRefPtr<CefBrowser> browser, const CefKe
 		return true;
 	} else if ((event.windows_key_code == 189 || event.windows_key_code == 109) &&
 		   (event.modifiers & EVENTFLAG_CONTROL_DOWN) != 0) {
-		// Zoom out
-		return widget->zoomPage(-1);
+		return zoomPage(host, -1);
 	} else if ((event.windows_key_code == 187 || event.windows_key_code == 107) &&
 		   (event.modifiers & EVENTFLAG_CONTROL_DOWN) != 0) {
-		// Zoom in
-		return widget->zoomPage(1);
+		return zoomPage(host, 1);
 	} else if ((event.windows_key_code == 48 || event.windows_key_code == 96) &&
 		   (event.modifiers & EVENTFLAG_CONTROL_DOWN) != 0) {
-		// Reset zoom
-		return widget->zoomPage(0);
+		return zoomPage(host, 0);
 	}
 	return false;
 }
